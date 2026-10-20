@@ -10,4 +10,11 @@ CREATE TABLE IF NOT EXISTS movement (id BIGINT AUTO_INCREMENT PRIMARY KEY, batch
 CREATE TABLE IF NOT EXISTS requisition (id BIGINT AUTO_INCREMENT PRIMARY KEY, number VARCHAR(60) UNIQUE, store_id BIGINT, warehouse_id BIGINT, status VARCHAR(30), note VARCHAR(500), created_by BIGINT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS requisition_line (id BIGINT AUTO_INCREMENT PRIMARY KEY, requisition_id BIGINT, ingredient_id BIGINT, quantity DECIMAL(12,3));
 CREATE TABLE IF NOT EXISTS purchase_order (id BIGINT AUTO_INCREMENT PRIMARY KEY, number VARCHAR(60) UNIQUE, supplier_id BIGINT, warehouse_id BIGINT, status VARCHAR(30), total DECIMAL(12,2), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS purchase_line (id BIGINT AUTO_INCREMENT PRIMARY KEY, purchase_order_id BIGINT NOT NULL, ingredient_id BIGINT NOT NULL, quantity DECIMAL(12,3) NOT NULL CHECK (quantity > 0), unit_cost DECIMAL(12,2) NOT NULL CHECK (unit_cost >= 0));
 CREATE TABLE IF NOT EXISTS audit_log (id BIGINT AUTO_INCREMENT PRIMARY KEY, actor_id BIGINT, action VARCHAR(100), detail VARCHAR(500), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_stock_batch_issue ON stock_batch(ingredient_id,warehouse_id,expiry_date);
+CREATE INDEX IF NOT EXISTS idx_requisition_store_status ON requisition(store_id,status,created_at);
+CREATE INDEX IF NOT EXISTS idx_requisition_line_request ON requisition_line(requisition_id);
+CREATE INDEX IF NOT EXISTS idx_movement_reference ON movement(reference_no);
+CREATE INDEX IF NOT EXISTS idx_purchase_line_order ON purchase_line(purchase_order_id);
+CREATE INDEX IF NOT EXISTS idx_audit_actor_time ON audit_log(actor_id,created_at);

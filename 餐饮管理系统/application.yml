@@ -8,4 +8,7 @@ spring:
     password: ${DB_PASSWORD:}
   sql.init.mode: always
   jackson.time-zone: Asia/Shanghai
+  servlet.session.timeout: 30m
+  servlet.session.cookie.http-only: true
+  servlet.session.cookie.same-site: lax
 app.demo-password: ${DEMO_PASSWORD:Demo@123456}
