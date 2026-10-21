@@ -29,7 +29,7 @@ if not exist "%JAR%" (
 
 echo Starting the system. The browser will open shortly.
 start "" powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 12; Start-Process 'http://localhost:8080'"
-java -jar "%JAR%"
+java -jar "%JAR%" --spring.profiles.active=local
 
 if errorlevel 1 (
   echo The application stopped with an error.

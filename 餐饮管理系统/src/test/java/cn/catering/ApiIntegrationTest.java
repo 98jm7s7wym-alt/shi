@@ -260,6 +260,87 @@ class ApiIntegrationTest {
                 .andExpect(status().isForbidden());
     }
 
+    @Test
+    void dashboardEndpointsAndLedgerMutationsStayConsistent() throws Exception {
+        Auth warehouse = login("warehouse");
+        JsonNode before = dashboard(warehouse);
+        BigDecimal stockValueBefore = before.path("STOCK_VALUE").decimalValue();
+        int lowCountBefore = before.path("LOW_COUNT").asInt();
+
+        MvcResult ingredientResult = mvc.perform(auth(post("/api/action/save-ingredient"), warehouse)
+                        .content("""
+                                {
+                                  "name": "仪表盘测试食材",
+                                  "categoryId": 4,
+                                  "specification": "测试",
+                                  "unit": "kg",
+                                  "price": 5,
+                                  "shelfDays": 30,
+                                  "minStock": 1,
+                                  "maxStock": 10
+                                }
+                                """))
+                .andExpect(status().isOk())
+                .andReturn();
+        long ingredientId = json.readTree(ingredientResult.getResponse().getContentAsString()).path("id").asLong();
+
+        MvcResult inboundResult = mvc.perform(auth(post("/api/ledger/inbound"), warehouse)
+                        .content("""
+                                {
+                                  "ingredientId": %d,
+                                  "warehouseId": 1,
+                                  "supplierId": 1,
+                                  "batchNo": "DASHBOARD-TEST-BATCH",
+                                  "expiryDate": "2030-01-01",
+                                  "quantity": 2,
+                                  "unitCost": 5
+                                }
+                                """.formatted(ingredientId)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.quantity").value(2))
+                .andReturn();
+        long batchId = json.readTree(inboundResult.getResponse().getContentAsString()).path("batchId").asLong();
+
+        JsonNode afterInbound = dashboard(warehouse);
+        assertThat(afterInbound.path("STOCK_VALUE").decimalValue())
+                .isEqualByComparingTo(stockValueBefore.add(new BigDecimal("10")));
+        assertThat(afterInbound.path("LOW_COUNT").asInt()).isEqualTo(lowCountBefore);
+
+        mvc.perform(get("/api/categories").session(warehouse.session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].RATIO").isNumber());
+        mvc.perform(get("/api/inventory-value").session(warehouse.session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.TOTAL").isNumber());
+        mvc.perform(get("/api/batches/expiring").session(warehouse.session()))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/ingredients/low-stock").session(warehouse.session()))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/attention").session(warehouse.session()))
+                .andExpect(status().isOk());
+        mvc.perform(get("/api/ledger").param("categoryId", "4").session(warehouse.session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].CATEGORY_ID").value(4));
+        mvc.perform(get("/api/inventory/batches/" + batchId).session(warehouse.session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.BATCH.BATCH_NO").value("DASHBOARD-TEST-BATCH"));
+        mvc.perform(get("/api/ingredients/" + ingredientId).session(warehouse.session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.INGREDIENT.NAME").value("仪表盘测试食材"));
+
+        mvc.perform(auth(post("/api/ledger/outbound"), warehouse)
+                        .content("""
+                                {"batchId": %d, "quantity": 2, "referenceNo": "DASHBOARD-TEST-OUT"}
+                                """.formatted(batchId)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.remaining").value(0));
+
+        JsonNode afterOutbound = dashboard(warehouse);
+        assertThat(afterOutbound.path("STOCK_VALUE").decimalValue())
+                .isEqualByComparingTo(stockValueBefore);
+        assertThat(afterOutbound.path("LOW_COUNT").asInt()).isEqualTo(lowCountBefore + 1);
+    }
+
     private long createRequisition(Auth auth, long storeId, long warehouseId, double quantity) throws Exception {
         MvcResult result = mvc.perform(auth(post("/api/action/create-requisition"), auth)
                         .content("""
@@ -302,6 +383,13 @@ class ApiIntegrationTest {
                 "SELECT COALESCE(SUM(quantity),0) FROM stock_batch WHERE ingredient_id=? AND warehouse_id=?",
                 BigDecimal.class, ingredientId, warehouseId);
         return value == null ? BigDecimal.ZERO : value;
+    }
+
+    private JsonNode dashboard(Auth auth) throws Exception {
+        MvcResult result = mvc.perform(get("/api/dashboard").session(auth.session()))
+                .andExpect(status().isOk())
+                .andReturn();
+        return json.readTree(result.getResponse().getContentAsString());
     }
 
     private record Auth(MockHttpSession session, String csrf) {

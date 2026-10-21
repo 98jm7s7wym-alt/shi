@@ -3,6 +3,7 @@ package cn.catering;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpSession;
 import java.math.BigDecimal;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -17,6 +18,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 
@@ -150,6 +152,147 @@ public class ApiController {
         return result;
     }
 
+    @GetMapping("/dashboard")
+    public Map<String, Object> dashboard() {
+        Map<String, Object> result = new LinkedHashMap<>(stats());
+        List<Map<String, Object>> categories = dashboardCategories();
+        List<Map<String, Object>> attention = attentionRows();
+        result.put("CATEGORIES", categories);
+        result.put("ATTENTION", attention.stream().limit(12).toList());
+        result.put("ATTENTION_COUNT", attention.size());
+        return result;
+    }
+
+    @GetMapping("/inventory-value")
+    public Map<String, Object> inventoryValue() {
+        List<Map<String, Object>> rows = rows(
+                "SELECT b.id,b.batch_no,b.quantity,b.unit_cost,b.expiry_date," +
+                        "b.quantity*b.unit_cost stock_value,i.id ingredient_id,i.name ingredient_name," +
+                        "c.id category_id,c.name category_name,w.id warehouse_id,w.name warehouse_name " +
+                        "FROM stock_batch b JOIN ingredient i ON b.ingredient_id=i.id " +
+                        "JOIN category c ON i.category_id=c.id JOIN warehouse w ON b.warehouse_id=w.id " +
+                        "ORDER BY stock_value DESC,b.expiry_date");
+        BigDecimal total = rows.stream()
+                .map(row -> decimalValue(row.get("STOCK_VALUE")))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        return Map.of("TOTAL", total, "ITEMS", rows);
+    }
+
+    @GetMapping("/categories")
+    public List<Map<String, Object>> categories() {
+        return dashboardCategories();
+    }
+
+    @GetMapping("/categories/{id}/inventory")
+    public Map<String, Object> categoryInventory(@PathVariable long id) {
+        List<Map<String, Object>> categories = rows("SELECT * FROM category WHERE id=?", id);
+        if (categories.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "分类不存在");
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("CATEGORY", categories.get(0));
+        result.put("INGREDIENTS", rows(
+                "SELECT i.*,c.name category_name,COALESCE(SUM(b.quantity),0) stock," +
+                        "COALESCE(SUM(b.quantity*b.unit_cost),0) stock_value " +
+                        "FROM ingredient i JOIN category c ON i.category_id=c.id " +
+                        "LEFT JOIN stock_batch b ON b.ingredient_id=i.id " +
+                        "WHERE i.category_id=? GROUP BY i.id,c.name ORDER BY i.name", id));
+        result.put("BATCHES", ledgerRows(id));
+        return result;
+    }
+
+    @GetMapping("/batches/expiring")
+    public List<Map<String, Object>> expiringBatches() {
+        return expiringRows();
+    }
+
+    @GetMapping("/ingredients/low-stock")
+    public List<Map<String, Object>> lowStockIngredients() {
+        return lowStockRows();
+    }
+
+    @GetMapping("/attention")
+    public List<Map<String, Object>> attention() {
+        return attentionRows();
+    }
+
+    @GetMapping("/ledger")
+    public List<Map<String, Object>> ledger(@RequestParam(required = false) Long categoryId) {
+        return ledgerRows(categoryId);
+    }
+
+    @GetMapping("/inventory/batches/{id}")
+    public Map<String, Object> batchDetail(@PathVariable long id) {
+        List<Map<String, Object>> batches = rows(
+                "SELECT b.*,i.name ingredient_name,i.unit,c.id category_id,c.name category_name," +
+                        "w.name warehouse_name,s.name supplier_name FROM stock_batch b " +
+                        "JOIN ingredient i ON b.ingredient_id=i.id JOIN category c ON i.category_id=c.id " +
+                        "JOIN warehouse w ON b.warehouse_id=w.id LEFT JOIN supplier s ON b.supplier_id=s.id " +
+                        "WHERE b.id=?", id);
+        if (batches.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "库存批次不存在");
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("BATCH", batches.get(0));
+        result.put("MOVEMENTS", rows(
+                "SELECT m.*,u.name actor_name FROM movement m LEFT JOIN app_user u ON m.actor_id=u.id " +
+                        "WHERE m.batch_id=? ORDER BY m.created_at DESC", id));
+        return result;
+    }
+
+    @GetMapping("/ingredients/{id}")
+    public Map<String, Object> ingredientDetail(@PathVariable long id) {
+        List<Map<String, Object>> ingredients = rows(
+                "SELECT i.*,c.name category_name,COALESCE(SUM(b.quantity),0) stock," +
+                        "COALESCE(SUM(b.quantity*b.unit_cost),0) stock_value " +
+                        "FROM ingredient i JOIN category c ON i.category_id=c.id " +
+                        "LEFT JOIN stock_batch b ON b.ingredient_id=i.id WHERE i.id=? " +
+                        "GROUP BY i.id,c.name", id);
+        if (ingredients.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "食材不存在");
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("INGREDIENT", ingredients.get(0));
+        result.put("BATCHES", rows(
+                "SELECT b.*,w.name warehouse_name,s.name supplier_name FROM stock_batch b " +
+                        "JOIN warehouse w ON b.warehouse_id=w.id LEFT JOIN supplier s ON b.supplier_id=s.id " +
+                        "WHERE b.ingredient_id=? ORDER BY b.expiry_date", id));
+        result.put("MOVEMENTS", rows(
+                "SELECT m.*,b.batch_no,u.name actor_name FROM movement m " +
+                        "JOIN stock_batch b ON m.batch_id=b.id LEFT JOIN app_user u ON m.actor_id=u.id " +
+                        "WHERE b.ingredient_id=? ORDER BY m.created_at DESC LIMIT 50", id));
+        return result;
+    }
+
+    @PostMapping("/ledger/inbound")
+    public Map<String, Object> inbound(
+            @RequestBody Map<String, Object> body,
+            HttpServletRequest request) {
+        requirePermission(request, "stock");
+        return operations.inboundStock(
+                requiredLong(body, "ingredientId"),
+                requiredLong(body, "warehouseId"),
+                optionalLong(body, "supplierId"),
+                String.valueOf(body.getOrDefault("batchNo", "")),
+                parseDate(body.get("expiryDate")),
+                requiredDecimal(body, "quantity"),
+                requiredDecimal(body, "unitCost"),
+                longValue(request.getAttribute("uid")));
+    }
+
+    @PostMapping("/ledger/outbound")
+    public Map<String, Object> outbound(
+            @RequestBody Map<String, Object> body,
+            HttpServletRequest request) {
+        requirePermission(request, "stock");
+        return operations.outboundStock(
+                requiredLong(body, "batchId"),
+                requiredDecimal(body, "quantity"),
+                String.valueOf(body.getOrDefault("referenceNo", "")),
+                optionalLong(body, "storeId"),
+                longValue(request.getAttribute("uid")));
+    }
+
     @PostMapping("/action/{action}")
     public Map<String, Object> action(
             @PathVariable String action,
@@ -280,9 +423,78 @@ public class ApiController {
         return up(db.queryForMap(
                 "SELECT (SELECT COUNT(*) FROM ingredient) ingredient_count," +
                         "COALESCE((SELECT SUM(quantity*unit_cost) FROM stock_batch),0) stock_value," +
-                        "(SELECT COUNT(*) FROM stock_batch WHERE expiry_date<=DATEADD('DAY',3,CURRENT_DATE)) expiring_count," +
+                        "(SELECT COUNT(*) FROM stock_batch WHERE expiry_date<=?) expiring_count," +
                         "(SELECT COUNT(*) FROM ingredient i WHERE COALESCE(" +
-                        "(SELECT SUM(b.quantity) FROM stock_batch b WHERE b.ingredient_id=i.id),0)<i.min_stock) low_count"));
+                        "(SELECT SUM(b.quantity) FROM stock_batch b WHERE b.ingredient_id=i.id),0)<i.min_stock) low_count",
+                java.sql.Date.valueOf(LocalDate.now().plusDays(3))));
+    }
+
+    private List<Map<String, Object>> dashboardCategories() {
+        List<Map<String, Object>> categories = rows(
+                "SELECT c.id,c.name,COUNT(DISTINCT i.id) ingredient_count," +
+                        "COALESCE((SELECT SUM(b.quantity) FROM stock_batch b " +
+                        "JOIN ingredient bi ON b.ingredient_id=bi.id WHERE bi.category_id=c.id),0) stock_quantity," +
+                        "COALESCE((SELECT SUM(b.quantity*b.unit_cost) FROM stock_batch b " +
+                        "JOIN ingredient bi ON b.ingredient_id=bi.id WHERE bi.category_id=c.id),0) stock_value," +
+                        "COALESCE((SELECT SUM(i2.min_stock) FROM ingredient i2 WHERE i2.category_id=c.id),0) safety_stock," +
+                        "COALESCE((SELECT SUM(i3.max_stock) FROM ingredient i3 WHERE i3.category_id=c.id),0) target_stock " +
+                        "FROM category c LEFT JOIN ingredient i ON i.category_id=c.id " +
+                        "GROUP BY c.id,c.name ORDER BY c.id");
+        for (Map<String, Object> category : categories) {
+            BigDecimal target = decimalValue(category.get("TARGET_STOCK"));
+            BigDecimal stock = decimalValue(category.get("STOCK_QUANTITY"));
+            int ratio = target.signum() <= 0
+                    ? 0
+                    : stock.multiply(BigDecimal.valueOf(100))
+                    .divide(target, 0, java.math.RoundingMode.DOWN)
+                    .min(BigDecimal.valueOf(100))
+                    .intValue();
+            category.put("RATIO", ratio);
+        }
+        return categories;
+    }
+
+    private List<Map<String, Object>> expiringRows() {
+        return rows(
+                "SELECT 'EXPIRING' attention_type," +
+                        "CASE WHEN b.expiry_date<CURRENT_DATE THEN 'red' ELSE 'amber' END severity," +
+                        "b.id batch_id,b.ingredient_id,i.name title,i.unit,b.batch_no,b.quantity," +
+                        "b.expiry_date,w.name warehouse_name FROM stock_batch b " +
+                        "JOIN ingredient i ON b.ingredient_id=i.id JOIN warehouse w ON b.warehouse_id=w.id " +
+                        "WHERE b.expiry_date<=? ORDER BY b.expiry_date,b.id",
+                java.sql.Date.valueOf(LocalDate.now().plusDays(3)));
+    }
+
+    private List<Map<String, Object>> lowStockRows() {
+        return rows(
+                "SELECT attention_type,severity,ingredient_id,title,unit,current_stock,min_stock,max_stock,shortage " +
+                        "FROM (SELECT 'LOW_STOCK' attention_type,'red' severity,i.id ingredient_id," +
+                        "i.name title,i.unit,COALESCE(SUM(b.quantity),0) current_stock,i.min_stock,i.max_stock," +
+                        "i.min_stock-COALESCE(SUM(b.quantity),0) shortage " +
+                        "FROM ingredient i LEFT JOIN stock_batch b ON b.ingredient_id=i.id " +
+                        "GROUP BY i.id,i.name,i.unit,i.min_stock,i.max_stock) stock_status " +
+                        "WHERE current_stock<min_stock ORDER BY shortage DESC,ingredient_id");
+    }
+
+    private List<Map<String, Object>> attentionRows() {
+        List<Map<String, Object>> attention = new ArrayList<>();
+        attention.addAll(expiringRows());
+        attention.addAll(lowStockRows());
+        return attention;
+    }
+
+    private List<Map<String, Object>> ledgerRows(Long categoryId) {
+        String base = "SELECT b.*,i.name ingredient_name,i.unit,i.category_id,c.name category_name," +
+                "w.name warehouse_name,s.name supplier_name,b.quantity*b.unit_cost stock_value," +
+                "CASE WHEN b.expiry_date<CURRENT_DATE THEN 'EXPIRED' " +
+                "WHEN b.expiry_date<=? THEN 'EXPIRING' ELSE 'NORMAL' END expiry_status " +
+                "FROM stock_batch b JOIN ingredient i ON b.ingredient_id=i.id " +
+                "JOIN category c ON i.category_id=c.id JOIN warehouse w ON b.warehouse_id=w.id " +
+                "LEFT JOIN supplier s ON b.supplier_id=s.id ";
+        java.sql.Date expiryLimit = java.sql.Date.valueOf(LocalDate.now().plusDays(3));
+        return categoryId == null
+                ? rows(base + "ORDER BY b.expiry_date,b.id", expiryLimit)
+                : rows(base + "WHERE i.category_id=? ORDER BY b.expiry_date,b.id", expiryLimit, categoryId);
     }
 
     private Map<String, Object> current(HttpServletRequest request) {
@@ -395,5 +607,23 @@ public class ApiController {
 
     private Long longObject(Object value) {
         return value == null ? null : longValue(value);
+    }
+
+    private BigDecimal decimalValue(Object value) {
+        if (value == null) {
+            return BigDecimal.ZERO;
+        }
+        return value instanceof BigDecimal decimal ? decimal : new BigDecimal(String.valueOf(value));
+    }
+
+    private LocalDate parseDate(Object value) {
+        if (value == null || String.valueOf(value).isBlank()) {
+            return null;
+        }
+        try {
+            return LocalDate.parse(String.valueOf(value));
+        } catch (RuntimeException exception) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "日期格式不正确");
+        }
     }
 }

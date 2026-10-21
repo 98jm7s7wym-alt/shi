@@ -3,10 +3,26 @@ const $$ = selector => [...document.querySelectorAll(selector)];
 
 let state = {};
 let currentView = 'overview';
+let viewHistory = [];
 let draftReqLines = [];
 let inventoryTerm = '';
 let inventoryWarehouse = '';
 let ingredientTerm = '';
+let pageState = {loading: false, error: '', data: null, params: {}};
+let renderSequence = 0;
+
+const dataViews = {
+  overview: () => '/dashboard',
+  stockValue: () => '/inventory-value',
+  categoryList: () => '/categories',
+  expiring: () => '/batches/expiring',
+  lowStock: () => '/ingredients/low-stock',
+  attention: () => '/attention',
+  inventory: () => `/ledger${pageState.params.categoryId ? `?categoryId=${encodeURIComponent(pageState.params.categoryId)}` : ''}`,
+  categoryInventory: () => `/categories/${pageState.params.id}/inventory`,
+  batchDetail: () => `/inventory/batches/${pageState.params.id}`,
+  ingredientDetail: () => `/ingredients/${pageState.params.id}`
+};
 
 const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({
   '&': '&amp;',
@@ -44,6 +60,14 @@ function toast(message) {
   toast.timer = setTimeout(() => element.style.display = 'none', 2600);
 }
 
+function pageLoading(title) {
+  return `<div class="panel page-state"><span class="loading-ring"></span><h2>正在加载${esc(title)}</h2><p>正在从服务端汇总最新数据，请稍候。</p></div>`;
+}
+
+function pageError(message) {
+  return `<div class="panel page-state error-state"><span class="state-mark">!</span><h2>数据加载失败</h2><p>${esc(message)}</p><button class="primary" id="retryPage">重新加载</button><button class="secondary" data-go="overview">返回首页</button></div>`;
+}
+
 function permissions() {
   if (Array.isArray(state.permissions)) return state.permissions;
   const raw = userField('PERMISSIONS') || '';
@@ -60,6 +84,7 @@ function canAny(...values) {
 
 function viewAllowed(view) {
   if (view === 'overview' || view === 'settings') return true;
+  if (['stockValue', 'categoryList', 'expiring', 'lowStock', 'attention', 'categoryInventory', 'batchDetail', 'ingredientDetail'].includes(view)) return true;
   if (view === 'inventory') return canAny('stock', 'report');
   if (view === 'ingredients') return can('stock');
   if (view === 'requisition') return canAny('kitchen', 'stock');
@@ -107,40 +132,94 @@ async function refresh() {
   state = await api('/data');
   syncHeader();
   applyPermissions();
-  render(currentView);
+  await render(currentView, {params: pageState.params});
 }
 
-function render(view) {
+function updateBackButton() {
+  const button = $('#backButton');
+  if (!button) return;
+  button.disabled = viewHistory.length === 0;
+}
+
+function updateAlertBadge() {
+  const dashboard = pageState.data;
+  if (currentView !== 'overview' || !dashboard) return;
+  $('#navAlert').textContent = number(dashboard.EXPIRING_COUNT) + number(dashboard.LOW_COUNT);
+}
+
+async function render(view, options = {}) {
   if (!viewAllowed(view)) view = 'overview';
   if (!views[view]) view = 'overview';
   document.body.classList.remove('nav-open');
+  if (!options.fromBack && currentView && currentView !== view) {
+    viewHistory.push(currentView);
+    if (viewHistory.length > 20) viewHistory.shift();
+  }
   currentView = view;
   $$('.nav').forEach(button => button.classList.toggle('active', button.dataset.view === view));
   const names = {
     overview: '运营概览',
+    stockValue: '库存总值明细',
+    categoryList: '食材品类',
+    expiring: '临期批次',
+    lowStock: '低库存列表',
+    attention: '关注事项',
     inventory: '库存台账',
     ingredients: '食材档案',
     requisition: '门店领料',
     purchase: '采购管理',
     suppliers: '供应商',
     reports: '统计报表',
-    settings: '系统设置'
+    settings: '系统设置',
+    categoryInventory: '分类库存',
+    batchDetail: '批次详情',
+    ingredientDetail: '食材详情'
   };
-  $('#pageName').textContent = names[view];
-  $('#pageTitle').textContent = view === 'overview' ? '早上好，今天也辛苦了。' : names[view];
+  $('#pageName').textContent = names[view] || '详情';
+  $('#pageTitle').textContent = view === 'overview' ? '早上好，今天也辛苦了。' : (names[view] || '详情');
   $('#quickAction').style.display = view === 'overview' && can('kitchen') ? 'block' : 'none';
+  const sequence = ++renderSequence;
+  if (dataViews[view]) {
+    pageState = {loading: true, error: '', data: null, params: options.params || {}};
+    $('#content').innerHTML = pageLoading(names[view] || '页面');
+    try {
+      const data = await api(dataViews[view]());
+      if (sequence !== renderSequence) return;
+      pageState = {loading: false, error: '', data, params: options.params || {}};
+    } catch (error) {
+      if (sequence !== renderSequence) return;
+      pageState = {loading: false, error: error.message || '接口请求失败', data: null, params: options.params || {}};
+      $('#content').innerHTML = pageError(error.message || '接口请求失败');
+      updateBackButton();
+      wire(view);
+      return;
+    }
+  } else {
+    pageState = {loading: false, error: '', data: null, params: options.params || {}};
+  }
   $('#content').innerHTML = views[view]();
+  updateAlertBadge();
+  updateBackButton();
   applyPermissions();
   wire(view);
 }
 
+function goBack() {
+  const previousView = viewHistory.pop();
+  if (!previousView || !viewAllowed(previousView)) {
+    updateBackButton();
+    return;
+  }
+  render(previousView, {fromBack: true});
+}
+
 function cards() {
-  const stats = state.stats || {};
+  const stats = pageState.data || {};
   return `<div class="metrics">
-    <div class="metric"><div class="metric-top"><span>库存总值</span><span class="metric-icon">¥</span></div><div class="metric-value">${money(stats.STOCK_VALUE)}</div><div class="metric-foot"><span class="up">实时</span> · 当前批次成本汇总</div></div>
-    <div class="metric"><div class="metric-top"><span>食材品类</span><span class="metric-icon">类</span></div><div class="metric-value">${stats.INGREDIENT_COUNT || 0}<small> 类</small></div><div class="metric-foot">覆盖 ${(state.categories || []).length} 个业务分类</div></div>
-    <div class="metric"><div class="metric-top"><span>临期预警</span><span class="metric-icon">△</span></div><div class="metric-value">${stats.EXPIRING_COUNT || 0}<small> 批</small></div><div class="metric-foot"><span class="warn">三日内到期，优先处理</span></div></div>
-    <div class="metric"><div class="metric-top"><span>库存不足</span><span class="metric-icon">!</span></div><div class="metric-value">${stats.LOW_COUNT || 0}<small> 项</small></div><div class="metric-foot"><span class="warn">低于安全库存线</span></div></div>
+    <button class="metric" data-go="stockValue"><div class="metric-top"><span>库存总值</span><span class="metric-icon">¥</span></div><div class="metric-value">${money(stats.STOCK_VALUE)}</div><div class="metric-foot"><span class="up">点击查看</span> · 批次成本明细</div></button>
+    <button class="metric" data-go="categoryList"><div class="metric-top"><span>食材品类</span><span class="metric-icon">类</span></div><div class="metric-value">${stats.INGREDIENT_COUNT || 0}<small> 类</small></div><div class="metric-foot">点击查看分类库存</div></button>
+    <button class="metric" data-go="expiring"><div class="metric-top"><span>临期预警</span><span class="metric-icon">△</span></div><div class="metric-value">${stats.EXPIRING_COUNT || 0}<small> 批</small></div><div class="metric-foot"><span class="warn">三日内到期，点击查看</span></div></button>
+    <button class="metric" data-go="lowStock"><div class="metric-top"><span>库存不足</span><span class="metric-icon">!</span></div><div class="metric-value">${stats.LOW_COUNT || 0}<small> 项</small></div><div class="metric-foot"><span class="warn">低于安全库存，点击查看</span></div></button>
   </div>`;
 }
 
@@ -171,16 +250,20 @@ function daysUntil(value) {
 }
 
 function healthPanel() {
-  const items = categoryHealth();
-  return `<div class="health-list">${items.map(item => `<div class="health-item"><div class="health-head"><span>${esc(item.name)}</span><b>${item.percent}%</b></div><div class="bar"><i class="${item.percent < 55 ? 'amber' : ''}" style="width:${item.percent}%"></i></div></div>`).join('') || '<div class="empty">暂无库存健康数据</div>'}</div>`;
+  const items = pageState.data?.CATEGORIES || [];
+  return `<div class="health-list">${items.map(item => `<button class="health-item" data-go="categoryInventory" data-id="${item.ID}"><div class="health-head"><span>${esc(item.NAME)}</span><b>${number(item.RATIO)}%</b></div><div class="bar"><i class="${number(item.RATIO) < 55 ? 'amber' : ''}" style="width:${number(item.RATIO)}%"></i></div></button>`).join('') || '<div class="empty">暂无库存健康数据</div>'}</div>`;
 }
 
-function alertsPanel() {
-  const alerts = expiringBatches();
-  return alerts.slice(0, 4).map(item => {
-    const days = daysUntil(item.EXPIRY_DATE);
-    const expired = days < 0;
-    return `<div class="alert-item"><i class="alert-dot ${expired ? 'red' : ''}"></i><div><b>${esc(item.INGREDIENT_NAME)}</b><span>${expired ? '已过期' : '即将到期'} · ${esc(item.BATCH_NO)}</span></div><time>${expired ? `逾期 ${Math.abs(days)} 天` : `${days} 天`}</time></div>`;
+function alertsPanel(limit = 4) {
+  const alerts = Array.isArray(pageState.data) ? pageState.data : (pageState.data?.ATTENTION || []);
+  const rows = currentView === 'attention' ? alerts : alerts.slice(0, limit);
+  return rows.map(item => {
+    const isExpiring = item.ATTENTION_TYPE === 'EXPIRING';
+    const days = isExpiring ? daysUntil(item.EXPIRY_DATE) : null;
+    const subtitle = isExpiring
+      ? `${days < 0 ? '已过期' : '即将到期'} · ${item.BATCH_NO}`
+      : `当前 ${number(item.CURRENT_STOCK)}，安全库存 ${number(item.MIN_STOCK)}`;
+    return `<button class="alert-item" data-go="${isExpiring ? 'batchDetail' : 'ingredientDetail'}" data-id="${isExpiring ? item.BATCH_ID : item.INGREDIENT_ID}"><i class="alert-dot ${item.SEVERITY === 'red' ? 'red' : ''}"></i><div><b>${esc(item.TITLE)}</b><span>${esc(subtitle)}</span></div><time>${isExpiring ? (days < 0 ? `逾期 ${Math.abs(days)} 天` : `${days} 天`) : `缺 ${number(item.SHORTAGE)}`}</time></button>`;
   }).join('') || '<div class="empty">当前没有临期批次</div>';
 }
 
@@ -314,7 +397,7 @@ const views = {
           ${healthPanel()}
         </div>
         <div class="panel">
-          <div class="panel-title-line"><div><span class="panel-index">02 / ATTENTION</span><h2>需要关注</h2></div><span class="status amber">${expiringBatches().length} 条</span></div>
+          <div class="panel-title-line"><div><span class="panel-index">02 / ATTENTION</span><h2>需要关注</h2></div><button class="link-button" data-go="attention">${pageState.data?.ATTENTION_COUNT || 0} 条 →</button></div>
           <div class="attention-list">${alertsPanel()}</div>
         </div>
       </div>
@@ -330,7 +413,44 @@ const views = {
       </div>
     </div>`,
 
-  inventory: () => `<div class="toolbar"><input class="search" id="filter" value="${esc(inventoryTerm)}" placeholder="⌕  搜索食材名称或批次"><select class="select" id="warehouseFilter"><option value="">全部仓库</option>${(state.warehouses || []).map(warehouse => `<option value="${warehouse.ID}" ${String(inventoryWarehouse) === String(warehouse.ID) ? 'selected' : ''}>${esc(warehouse.NAME)}</option>`).join('')}</select><button class="secondary" onclick="location.href='/api/export/inventory'">⇩ 导出台账</button></div><div class="full-panel"><div class="section-head"><div><span class="panel-index">INVENTORY / BATCH LEDGER</span><h2>库存批次台账</h2><p>共 <span id="batchCount">${(state.batches || []).length}</span> 条批次记录 · 按到期日排序</p></div><span class="status green">实时数据</span></div><table><thead><tr><th>食材</th><th>批次号</th><th>所在仓库</th><th>当前数量</th><th>单位成本</th><th>到期日期</th><th>状态</th><th>操作</th></tr></thead><tbody id="batchRows">${batchRows(filteredBatches())}</tbody></table></div>`,
+  stockValue: () => {
+    const data = pageState.data || {};
+    const rows = data.ITEMS || [];
+    return `<div class="summary-strip"><div><span>库存总值</span><strong>${money(data.TOTAL)}</strong></div><div><span>批次数量</span><strong>${rows.length}</strong></div>${canAny('stock', 'report') ? '<button class="secondary" data-go="inventory">查看库存台账</button>' : ''}</div><div class="full-panel"><div class="section-head"><div><span class="panel-index">VALUE / BATCH CONTRIBUTION</span><h2>库存总值明细</h2><p>每个批次的剩余数量乘以单位成本</p></div></div><table><thead><tr><th>食材</th><th>分类</th><th>仓库</th><th>批次</th><th>数量</th><th>单位成本</th><th>库存价值</th><th>到期日</th></tr></thead><tbody>${rows.map(item => `<tr class="clickable-row" data-go="batchDetail" data-id="${item.ID}"><td data-label="食材"><b>${esc(item.INGREDIENT_NAME)}</b></td><td data-label="分类">${esc(item.CATEGORY_NAME)}</td><td data-label="仓库">${esc(item.WAREHOUSE_NAME)}</td><td data-label="批次"><code>${esc(item.BATCH_NO)}</code></td><td data-label="数量">${number(item.QUANTITY)}</td><td data-label="单位成本">${money(item.UNIT_COST)}</td><td data-label="库存价值"><b>${money(item.STOCK_VALUE)}</b></td><td data-label="到期日">${fmtDate(item.EXPIRY_DATE)}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">暂无库存价值数据</td></tr>'}</tbody></table></div>`;
+  },
+
+  categoryList: () => {
+    const categories = pageState.data || [];
+    return `<div class="category-grid">${categories.map(category => `<button class="category-card" data-go="categoryInventory" data-id="${category.ID}"><div><span class="panel-index">CATEGORY ${String(category.ID).padStart(2, '0')}</span><h2>${esc(category.NAME)}</h2><p>${category.INGREDIENT_COUNT || 0} 种食材</p></div><div class="category-value"><strong>${money(category.STOCK_VALUE)}</strong><span>${number(category.RATIO)}% 库存水位</span></div><div class="bar"><i class="${number(category.RATIO) < 55 ? 'amber' : ''}" style="width:${number(category.RATIO)}%"></i></div></button>`).join('') || '<div class="panel empty">暂无分类数据</div>'}</div>`;
+  },
+
+  expiring: () => {
+    const rows = pageState.data || [];
+    return `<div class="summary-strip"><div><span>临期与过期批次</span><strong>${rows.length}</strong></div><p>按到期日升序排列，点击批次可查看库存流水和详情。</p></div><div class="full-panel"><div class="section-head"><div><span class="panel-index">ALERT / EXPIRY</span><h2>临期批次</h2><p>统计范围包含已过期、今日到期及未来三日内到期的批次</p></div></div><table><thead><tr><th>食材</th><th>批次</th><th>仓库</th><th>数量</th><th>到期日</th><th>状态</th></tr></thead><tbody>${rows.map(item => `<tr class="clickable-row" data-go="batchDetail" data-id="${item.BATCH_ID}"><td data-label="食材"><b>${esc(item.TITLE)}</b></td><td data-label="批次"><code>${esc(item.BATCH_NO)}</code></td><td data-label="仓库">${esc(item.WAREHOUSE_NAME)}</td><td data-label="数量">${number(item.QUANTITY)} ${esc(item.UNIT || '')}</td><td data-label="到期日">${fmtDate(item.EXPIRY_DATE)}</td><td data-label="状态"><span class="status ${item.SEVERITY}">${item.SEVERITY === 'red' ? '已过期' : '临期'}</span></td></tr>`).join('') || '<tr><td colspan="6" class="empty">暂无临期批次</td></tr>'}</tbody></table></div>`;
+  },
+
+  lowStock: () => {
+    const rows = pageState.data || [];
+    return `<div class="summary-strip"><div><span>低于安全库存</span><strong>${rows.length}</strong></div><p>当前库存必须低于食材自身设置的安全库存线。</p></div><div class="full-panel"><div class="section-head"><div><span class="panel-index">ALERT / SAFETY STOCK</span><h2>低库存列表</h2><p>点击食材可查看全部批次和库存流水</p></div></div><table><thead><tr><th>食材</th><th>当前库存</th><th>安全库存</th><th>目标库存</th><th>缺口</th></tr></thead><tbody>${rows.map(item => `<tr class="clickable-row" data-go="ingredientDetail" data-id="${item.INGREDIENT_ID}"><td data-label="食材"><b>${esc(item.TITLE)}</b></td><td data-label="当前库存">${number(item.CURRENT_STOCK)} ${esc(item.UNIT)}</td><td data-label="安全库存">${number(item.MIN_STOCK)}</td><td data-label="目标库存">${number(item.MAX_STOCK)}</td><td data-label="缺口"><span class="status red">缺 ${number(item.SHORTAGE)}</span></td></tr>`).join('') || '<tr><td colspan="5" class="empty">所有食材库存正常</td></tr>'}</tbody></table></div>`;
+  },
+
+  attention: () => {
+    const rows = pageState.data || [];
+    return `<div class="summary-strip"><div><span>关注事项</span><strong>${rows.length}</strong></div><p>集中展示临期、过期和低库存事项。</p></div><div class="panel attention-page-list">${alertsPanel(rows.length)}</div>`;
+  },
+
+  categoryInventory: () => {
+    const data = pageState.data || {};
+    const category = data.CATEGORY || {};
+    const ingredients = data.INGREDIENTS || [];
+    const batches = data.BATCHES || [];
+    return `<div class="summary-strip"><div><span>分类</span><strong>${esc(category.NAME || '-')}</strong></div><div><span>食材种类</span><strong>${ingredients.length}</strong></div><div><span>库存批次</span><strong>${batches.length}</strong></div><button class="secondary" data-go="categoryList">返回品类列表</button></div><div class="grid-2"><div class="panel"><div class="panel-title-line"><div><span class="panel-index">CATEGORY / INGREDIENTS</span><h2>分类食材</h2></div></div><div class="health-list">${ingredients.map(item => `<button class="health-item" data-go="ingredientDetail" data-id="${item.ID}"><div class="health-head"><span>${esc(item.NAME)}</span><b>${number(item.STOCK)} ${esc(item.UNIT)}</b></div><div class="bar"><i class="${number(item.STOCK) < number(item.MIN_STOCK) ? 'amber' : ''}" style="width:${number(item.MAX_STOCK) > 0 ? Math.min(100, number(item.STOCK) / number(item.MAX_STOCK) * 100) : 0}%"></i></div></button>`).join('') || '<div class="empty">该分类暂无食材</div>'}</div></div><div class="panel"><div class="panel-title-line"><div><span class="panel-index">CATEGORY / BATCHES</span><h2>分类批次</h2></div></div>${detailBatchList(batches)}</div></div>`;
+  },
+
+  batchDetail: () => detailView('BATCH', pageState.data || {}),
+  ingredientDetail: () => detailView('INGREDIENT', pageState.data || {}),
+
+  inventory: () => `<div class="toolbar"><input class="search" id="filter" value="${esc(inventoryTerm)}" placeholder="⌕  搜索食材名称或批次"><select class="select" id="categoryFilter"><option value="">全部分类</option>${(state.categories || []).map(category => `<option value="${category.ID}" ${String(pageState.params.categoryId || '') === String(category.ID) ? 'selected' : ''}>${esc(category.NAME)}</option>`).join('')}</select><select class="select" id="warehouseFilter"><option value="">全部仓库</option>${(state.warehouses || []).map(warehouse => `<option value="${warehouse.ID}" ${String(inventoryWarehouse) === String(warehouse.ID) ? 'selected' : ''}>${esc(warehouse.NAME)}</option>`).join('')}</select>${can('stock') ? '<button class="primary" id="inboundStock">＋ 入库</button>' : ''}<button class="secondary" onclick="location.href='/api/export/inventory'">⇩ 导出台账</button></div><div class="full-panel"><div class="section-head"><div><span class="panel-index">INVENTORY / BATCH LEDGER</span><h2>库存批次台账</h2><p>共 <span id="batchCount">${(pageState.data || []).length}</span> 条批次记录 · 按到期日排序</p></div><span class="status green">实时数据</span></div><table><thead><tr><th>食材</th><th>批次号</th><th>所在仓库</th><th>当前数量</th><th>单位成本</th><th>到期日期</th><th>状态</th><th>操作</th></tr></thead><tbody id="batchRows">${batchRows(filteredBatches())}</tbody></table></div>`,
 
   ingredients: () => `<div class="toolbar"><input class="search" id="ingredientFilter" value="${esc(ingredientTerm)}" placeholder="⌕  搜索食材、分类或规格"><button class="primary" id="newIngredient">＋ 新增食材</button></div><div class="full-panel"><div class="section-head"><div><span class="panel-index">MASTER DATA / INGREDIENTS</span><h2>食材主数据</h2><p>共 ${(state.ingredients || []).length} 种食材 · 安全库存与保质期设置</p></div><span class="status green">基础档案</span></div><table><thead><tr><th>食材</th><th>分类</th><th>规格</th><th>单位</th><th>参考价</th><th>保质期</th><th>库存线</th><th>当前库存</th><th>操作</th></tr></thead><tbody id="ingredientRows">${ingredientRows()}</tbody></table></div>`,
 
@@ -396,7 +516,12 @@ function batchRows(rows) {
   return (rows || []).map(batch => {
     const days = daysUntil(batch.EXPIRY_DATE);
     const status = days < 0 ? ['已过期', 'red'] : days <= 3 ? ['临期', 'amber'] : ['正常', 'green'];
-    return `<tr><td data-label="食材"><b>${esc(batch.INGREDIENT_NAME)}</b><small class="cell-note">${esc(batch.SUPPLIER_NAME || '未记录供应商')}</small></td><td data-label="批次号"><code>${esc(batch.BATCH_NO)}</code></td><td data-label="所在仓库">${esc(batch.WAREHOUSE_NAME)}</td><td data-label="当前数量"><b>${number(batch.QUANTITY)}</b></td><td data-label="单位成本">${money(batch.UNIT_COST)}</td><td data-label="到期日期">${fmtDate(batch.EXPIRY_DATE)}</td><td data-label="状态"><span class="status ${status[1]}">${status[0]}</span></td><td data-label="操作">${can('stock') ? `<button class="link-button adjust-stock" data-id="${batch.ID}">盘点</button>` : '-'}</td></tr>`;
+    const operations = [`<button class="link-button detail-batch" data-id="${batch.ID}">查看</button>`];
+    if (can('stock')) {
+      operations.push(`<button class="link-button adjust-stock" data-id="${batch.ID}">盘点</button>`);
+      operations.push(`<button class="link-button outbound-stock" data-id="${batch.ID}">出库</button>`);
+    }
+    return `<tr><td data-label="食材"><b>${esc(batch.INGREDIENT_NAME)}</b><small class="cell-note">${esc(batch.SUPPLIER_NAME || '未记录供应商')}</small></td><td data-label="批次号"><code>${esc(batch.BATCH_NO)}</code></td><td data-label="所在仓库">${esc(batch.WAREHOUSE_NAME)}</td><td data-label="当前数量"><b>${number(batch.QUANTITY)}</b></td><td data-label="单位成本">${money(batch.UNIT_COST)}</td><td data-label="到期日期">${fmtDate(batch.EXPIRY_DATE)}</td><td data-label="状态"><span class="status ${status[1]}">${status[0]}</span></td><td data-label="操作"><div class="table-actions">${operations.join('')}</div></td></tr>`;
   }).join('') || '<tr><td colspan="8" class="empty">暂无库存记录</td></tr>';
 }
 
@@ -418,6 +543,42 @@ function ingredientRows(term = ingredientTerm) {
   </tr>`).join('') || '<tr><td colspan="9" class="empty">没有匹配的食材</td></tr>';
 }
 
+function detailBatchList(batches) {
+  return `<div class="detail-list">${(batches || []).map(batch => `<button class="detail-list-item" data-go="batchDetail" data-id="${batch.ID}"><div><b>${esc(batch.BATCH_NO)}</b><span>${esc(batch.WAREHOUSE_NAME || '')} · 到期 ${fmtDate(batch.EXPIRY_DATE)}</span></div><strong>${number(batch.QUANTITY)}</strong></button>`).join('') || '<div class="empty">暂无批次</div>'}</div>`;
+}
+
+function movementRows(movements) {
+  return `<div class="movement-list">${(movements || []).map(item => {
+    const quantity = number(item.QUANTITY);
+    const sign = item.KIND === 'IN' ? '+' : item.KIND === 'OUT' ? '-' : quantity > 0 ? '+' : '';
+    return `<div class="movement-item"><span class="movement-kind ${item.KIND === 'OUT' || (item.KIND === 'ADJUST' && quantity < 0) ? 'out' : ''}">${esc(item.KIND)}</span><div><b>${esc(item.REFERENCE_NO || item.BATCH_NO || '-')}</b><span>${fmtDateTime(item.CREATED_AT)} · ${esc(item.ACTOR_NAME || '系统')}</span></div><strong>${sign}${quantity}</strong></div>`;
+  }).join('') || '<div class="empty">暂无库存流水</div>'}</div>`;
+}
+
+function detailView(kind, data) {
+  const batch = kind === 'BATCH';
+  const item = batch ? data.BATCH : data.INGREDIENT;
+  if (!item) return '<div class="panel empty">详情不存在</div>';
+  const title = batch ? item.INGREDIENT_NAME : item.NAME;
+  const subtitle = batch ? `${item.BATCH_NO} · ${item.WAREHOUSE_NAME}` : `${item.CATEGORY_NAME} · ${item.SPECIFICATION || '未设置规格'}`;
+  const fields = batch
+    ? [
+      ['当前数量', `${number(item.QUANTITY)} ${item.UNIT || ''}`],
+      ['单位成本', money(item.UNIT_COST)],
+      ['库存价值', money(number(item.QUANTITY) * number(item.UNIT_COST))],
+      ['供应商', item.SUPPLIER_NAME || '未记录'],
+      ['到期日期', fmtDate(item.EXPIRY_DATE)]
+    ]
+    : [
+      ['当前库存', `${number(item.STOCK)} ${item.UNIT}`],
+      ['安全库存', number(item.MIN_STOCK)],
+      ['目标库存', number(item.MAX_STOCK)],
+      ['参考价格', money(item.PRICE)],
+      ['保质期', `${item.SHELF_DAYS ?? '-'} 天`]
+    ];
+  return `<div class="summary-strip"><div><span>${batch ? '批次详情' : '食材详情'}</span><strong>${esc(title)}</strong><p>${esc(subtitle)}</p></div><button class="secondary" data-go="overview">返回首页</button></div><div class="grid-2"><div class="panel"><div class="panel-title-line"><div><span class="panel-index">DETAIL / ATTRIBUTES</span><h2>基本信息</h2></div></div><div class="detail-info">${fields.map(field => `<div><span>${field[0]}</span><b>${field[1]}</b></div>`).join('')}</div>${batch ? `<div class="form-actions"><button class="secondary" id="detailAdjustStock" data-id="${item.ID}">盘点</button>${can('stock') ? `<button class="primary" id="detailOutboundStock" data-id="${item.ID}">出库</button>` : ''}</div>` : `<div class="form-actions"><button class="secondary" data-go="categoryInventory" data-id="${item.CATEGORY_ID}">查看分类库存</button></div>`}</div><div class="panel"><div class="panel-title-line"><div><span class="panel-index">DETAIL / HISTORY</span><h2>${batch ? '批次流水' : '库存批次与流水'}</h2></div></div>${batch ? '' : detailBatchList(data.BATCHES)}${movementRows(data.MOVEMENTS)}</div></div>`;
+}
+
 function wireIngredientButtons() {
   $$('.edit-ingredient').forEach(button => button.onclick = () => openIngredientForm(button.dataset.id));
 }
@@ -429,7 +590,7 @@ function updateIngredientRows() {
 
 function filteredBatches() {
   const keyword = inventoryTerm.trim().toLowerCase();
-  return (state.batches || []).filter(batch => {
+  return (pageState.data || []).filter(batch => {
     const matchesText = !keyword || `${batch.INGREDIENT_NAME} ${batch.BATCH_NO}`.toLowerCase().includes(keyword);
     const matchesWarehouse = !inventoryWarehouse || String(batch.WAREHOUSE_ID) === String(inventoryWarehouse);
     return matchesText && matchesWarehouse;
@@ -444,11 +605,15 @@ function updateInventoryRows() {
 }
 
 function wireStockButtons() {
+  $$('.detail-batch').forEach(button => button.onclick = () => render('batchDetail', {params: {id: button.dataset.id}}));
   $$('.adjust-stock').forEach(button => button.onclick = () => openStockAdjustForm(button.dataset.id));
+  $$('.outbound-stock').forEach(button => button.onclick = () => openOutboundForm(button.dataset.id));
 }
 
 function openStockAdjustForm(batchId) {
-  const batch = (state.batches || []).find(item => String(item.ID) === String(batchId));
+  const rows = Array.isArray(pageState.data) ? pageState.data : [];
+  const batch = rows.find(item => String(item.ID) === String(batchId))
+    || (pageState.data?.BATCH && String(pageState.data.BATCH.ID) === String(batchId) ? pageState.data.BATCH : null);
   if (!batch) return toast('库存批次不存在');
   $('#stockAdjustForm')?.remove();
   $('#content').insertAdjacentHTML('afterbegin', `<div class="form-panel operation-form" id="stockAdjustForm">
@@ -466,6 +631,80 @@ function openStockAdjustForm(batchId) {
       note: $('#adjustNote').value
     });
   };
+}
+
+function newInboundForm() {
+  if (!can('stock')) return toast('当前角色不能执行入库');
+  const firstIngredient = state.ingredients?.[0];
+  $('#inboundForm')?.remove();
+  $('#content').insertAdjacentHTML('afterbegin', `<div class="form-panel operation-form" id="inboundForm">
+    <div class="section-head"><div><span class="panel-index">LEDGER / STOCK IN</span><h2>新增入库</h2><p>入库后库存总值和低库存数量会重新汇总</p></div><button class="link-button" id="closeInbound">关闭</button></div>
+    <div class="form-grid">
+      <label>食材<select id="inboundIngredient">${ingredientOptions(firstIngredient?.ID)}</select></label>
+      <label>仓库<select id="inboundWarehouse">${warehouseOptions('')}</select></label>
+      <label>供应商<select id="inboundSupplier"><option value="">不指定</option>${(state.suppliers || []).map(supplier => `<option value="${supplier.ID}">${esc(supplier.NAME)}</option>`).join('')}</select></label>
+      <label>批次号<input id="inboundBatchNo" maxlength="80" placeholder="留空自动生成"></label>
+      <label>到期日期<input id="inboundExpiry" type="date"></label>
+      <label>数量<input id="inboundQuantity" type="number" min="0.001" step="0.001" value="1"></label>
+      <label>单位成本<input id="inboundUnitCost" type="number" min="0" step="0.01" value="${number(firstIngredient?.PRICE).toFixed(2)}"></label>
+    </div>
+    <div class="form-actions"><button class="secondary" id="cancelInbound">取消</button><button class="primary" id="saveInbound">确认入库</button></div>
+  </div>`);
+  $('#inboundIngredient').onchange = event => {
+    const ingredient = state.ingredients.find(item => String(item.ID) === String(event.target.value));
+    $('#inboundUnitCost').value = number(ingredient?.PRICE).toFixed(2);
+  };
+  $('#closeInbound').onclick = $('#cancelInbound').onclick = () => $('#inboundForm').remove();
+  $('#saveInbound').onclick = async () => {
+    const quantity = Number($('#inboundQuantity').value);
+    const unitCost = Number($('#inboundUnitCost').value);
+    if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(unitCost) || unitCost < 0) return toast('数量和单位成本必须有效');
+    await submitMutation('/ledger/inbound', {
+      ingredientId: $('#inboundIngredient').value,
+      warehouseId: $('#inboundWarehouse').value,
+      supplierId: $('#inboundSupplier').value,
+      batchNo: $('#inboundBatchNo').value,
+      expiryDate: $('#inboundExpiry').value,
+      quantity,
+      unitCost
+    }, '入库成功');
+  };
+}
+
+function openOutboundForm(batchId) {
+  if (!can('stock')) return toast('当前角色不能执行出库');
+  const rows = Array.isArray(pageState.data) ? pageState.data : [];
+  const batch = rows.find(item => String(item.ID) === String(batchId))
+    || (pageState.data?.BATCH && String(pageState.data.BATCH.ID) === String(batchId) ? pageState.data.BATCH : null);
+  if (!batch) return toast('库存批次不存在');
+  $('#outboundForm')?.remove();
+  $('#content').insertAdjacentHTML('afterbegin', `<div class="form-panel operation-form" id="outboundForm">
+    <div class="section-head"><div><span class="panel-index">LEDGER / STOCK OUT</span><h2>库存出库</h2><p>${esc(batch.INGREDIENT_NAME || batch.BATCH_NO)} · 当前剩余 ${number(batch.QUANTITY)}</p></div><button class="link-button" id="closeOutbound">关闭</button></div>
+    <div class="form-grid"><label>出库数量<input id="outboundQuantity" type="number" min="0.001" step="0.001" max="${number(batch.QUANTITY)}" value="1"></label><label>业务单号<input id="outboundReference" maxlength="80" placeholder="留空自动生成"></label></div>
+    <div class="form-actions"><button class="secondary" id="cancelOutbound">取消</button><button class="primary" id="saveOutbound">确认出库</button></div>
+  </div>`);
+  $('#closeOutbound').onclick = $('#cancelOutbound').onclick = () => $('#outboundForm').remove();
+  $('#saveOutbound').onclick = async () => {
+    const quantity = Number($('#outboundQuantity').value);
+    if (!Number.isFinite(quantity) || quantity <= 0) return toast('请输入有效出库数量');
+    if (quantity > number(batch.QUANTITY)) return toast('出库数量不能大于批次剩余库存');
+    await submitMutation('/ledger/outbound', {
+      batchId: batch.ID,
+      quantity,
+      referenceNo: $('#outboundReference').value,
+      storeId: userField('STORE_ID') || null
+    }, '出库成功');
+  };
+}
+
+async function submitMutation(url, body, message) {
+  try {
+    await api(url, {method: 'POST', body: JSON.stringify(body)});
+    toast(message);
+    await refresh();
+  } catch (error) {
+    toast(error.message);
+  }
 }
 
 function openIngredientForm(ingredientId = '') {
@@ -565,7 +804,15 @@ function wirePurchaseButtons() {
 }
 
 function wire(view) {
-  $$('[data-go]').forEach(button => button.onclick = () => render(button.dataset.go));
+  const navigate = element => {
+    const params = {};
+    if (element.dataset.id) params.id = element.dataset.id;
+    if (element.dataset.categoryId) params.categoryId = element.dataset.categoryId;
+    render(element.dataset.go, {params});
+  };
+  $$('[data-go]').forEach(button => button.onclick = () => navigate(button));
+  $$('.clickable-row').forEach(row => row.onclick = () => navigate(row));
+  $('#retryPage')?.addEventListener('click', () => render(currentView, {params: pageState.params}));
   wireReqButtons();
   if (view === 'inventory') {
     $('#filter').oninput = event => {
@@ -576,6 +823,8 @@ function wire(view) {
       inventoryWarehouse = event.target.value;
       updateInventoryRows();
     };
+    $('#categoryFilter').onchange = event => render('inventory', {params: {categoryId: event.target.value}});
+    $('#inboundStock')?.addEventListener('click', newInboundForm);
     wireStockButtons();
   }
   if (view === 'ingredients') {
@@ -609,6 +858,10 @@ function wire(view) {
       $('#newUserRole').onchange = syncNewUserStore;
       syncNewUserStore();
     }
+  }
+  if (view === 'batchDetail') {
+    $('#detailAdjustStock')?.addEventListener('click', () => openStockAdjustForm($('#detailAdjustStock').dataset.id));
+    $('#detailOutboundStock')?.addEventListener('click', () => openOutboundForm($('#detailOutboundStock').dataset.id));
   }
 }
 
@@ -816,6 +1069,7 @@ function closeNavigation() {
 $('#navToggle').onclick = () => document.body.classList.toggle('nav-open');
 $('#navClose').onclick = closeNavigation;
 $('#navBackdrop').onclick = closeNavigation;
+$('#backButton').onclick = goBack;
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') {
     closeNavigation();
@@ -824,8 +1078,8 @@ document.addEventListener('keydown', event => {
 });
 
 $$('.nav').forEach(button => button.onclick = () => render(button.dataset.view));
-$('#quickAction').onclick = () => {
-  if (currentView !== 'requisition') render('requisition');
+$('#quickAction').onclick = async () => {
+  if (currentView !== 'requisition') await render('requisition');
   newRequisition();
 };
 $('#logout').onclick = async () => {

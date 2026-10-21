@@ -254,6 +254,80 @@ public class OperationsService {
     }
 
     @Transactional
+    public Map<String, Object> inboundStock(
+            long ingredientId,
+            long warehouseId,
+            Long supplierId,
+            String batchNo,
+            LocalDate expiryDate,
+            BigDecimal quantity,
+            BigDecimal unitCost,
+            long uid) {
+        requirePositive(quantity, "入库数量必须大于 0");
+        requireNonNegative(unitCost, "单位成本不能为负数");
+        requireIngredient(ingredientId);
+        requireRow("SELECT id FROM warehouse WHERE id=?", warehouseId, "仓库不存在");
+        if (supplierId != null) {
+            requireRow("SELECT id FROM supplier WHERE id=?", supplierId, "供应商不存在");
+        }
+
+        String normalizedBatchNo = batchNo == null || batchNo.isBlank()
+                ? "IN-" + System.currentTimeMillis()
+                : text(batchNo, 80);
+        Integer duplicate = db.queryForObject(
+                "SELECT COUNT(*) FROM stock_batch WHERE ingredient_id=? AND warehouse_id=? AND batch_no=?",
+                Integer.class, ingredientId, warehouseId, normalizedBatchNo);
+        if (duplicate != null && duplicate > 0) {
+            throw conflict("该仓库已存在相同食材和批次号");
+        }
+
+        long batchId = insert(
+                "INSERT INTO stock_batch(ingredient_id,warehouse_id,supplier_id,batch_no,expiry_date,quantity,unit_cost) " +
+                        "VALUES(?,?,?,?,?,?,?)",
+                ingredientId, warehouseId, supplierId, normalizedBatchNo,
+                expiryDate == null ? null : Date.valueOf(expiryDate), quantity, unitCost);
+        db.update(
+                "INSERT INTO movement(batch_id,kind,quantity,reference_no,actor_id,store_id) VALUES(?,?,?,?,?,NULL)",
+                batchId, "IN", quantity, normalizedBatchNo, uid);
+        audit(uid, "STOCK_IN", normalizedBatchNo + " / +" + quantity.toPlainString());
+        return Map.of("ok", true, "batchId", batchId, "batchNo", normalizedBatchNo, "quantity", quantity);
+    }
+
+    @Transactional
+    public Map<String, Object> outboundStock(
+            long batchId,
+            BigDecimal quantity,
+            String referenceNo,
+            Long storeId,
+            long uid) {
+        requirePositive(quantity, "出库数量必须大于 0");
+        List<Map<String, Object>> rows = db.queryForList(
+                "SELECT * FROM stock_batch WHERE id=? FOR UPDATE", batchId);
+        if (rows.isEmpty()) {
+            throw notFound("库存批次不存在");
+        }
+        Map<String, Object> batch = rows.get(0);
+        BigDecimal available = decimal(batch.get("quantity"));
+        if (quantity.compareTo(available) > 0) {
+            throw conflict("出库数量不能大于批次剩余库存");
+        }
+        BigDecimal remaining = available.subtract(quantity);
+        db.update("UPDATE stock_batch SET quantity=? WHERE id=?", remaining, batchId);
+        String normalizedReference = referenceNo == null || referenceNo.isBlank()
+                ? "CK-" + System.currentTimeMillis()
+                : text(referenceNo, 80);
+        db.update(
+                "INSERT INTO movement(batch_id,kind,quantity,reference_no,actor_id,store_id) VALUES(?,?,?,?,?,?)",
+                batchId, "OUT", quantity, normalizedReference, uid, storeId);
+        audit(uid, "STOCK_OUT", normalizedReference + " / -" + quantity.toPlainString());
+        return Map.of(
+                "ok", true,
+                "batchId", batchId,
+                "quantity", quantity,
+                "remaining", remaining);
+    }
+
+    @Transactional
     public void updateProfile(long uid, String name) {
         String displayName = requiredText(name, 50, "显示名称不能为空");
         db.update("UPDATE app_user SET name=? WHERE id=?", displayName, uid);
@@ -373,6 +447,12 @@ public class OperationsService {
 
     private void requireNonNegative(BigDecimal value, String message) {
         if (value == null || value.signum() < 0) {
+            throw badRequest(message);
+        }
+    }
+
+    private void requirePositive(BigDecimal value, String message) {
+        if (value == null || value.signum() <= 0) {
             throw badRequest(message);
         }
     }
