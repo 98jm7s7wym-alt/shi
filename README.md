@@ -17,6 +17,10 @@
 | 测试 | JUnit 5、Spring Boot Test、MockMvc |
 | 运行端口 | 默认 `8080` |
 
+## 更新日志
+
+版本功能、数据库变更、修复记录和验证结果见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 功能概览
 
 ### 运营概览
